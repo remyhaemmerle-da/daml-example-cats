@@ -1,0 +1,103 @@
+module Main where
+
+import qualified Daml.Script as S
+import Daml.Trigger
+import DA.Foldable (forA_)
+
+
+template Cat
+  with
+    owner : Party
+    isin : Int
+  where
+    signatory owner
+    key (owner, isin) : (Party, Int)
+    maintainer key._1
+
+    choice Feed : ()
+      with
+       foodCid : ContractId Food
+      controller owner
+      do
+        exercise foodCid Food_FeedCat
+
+template Food
+  with
+    owner : Party
+    isin : Int
+  where
+    signatory owner
+    key (owner, isin) : (Party, Int)
+    maintainer key._1
+
+    choice Food_FeedCat : ()
+      controller owner
+      do
+        pure ()
+
+trigger : Trigger ()
+trigger = Trigger
+  { initialize = pure ()
+  , updateState = \_ -> pure ()
+  , rule = feedTheCats
+  , registeredTemplates =  RegisteredTemplates [ registeredTemplate @Cat, registeredTemplate @Food ]
+  , heartbeat = None
+  }
+
+
+feedTheCats: Party -> TriggerA s ()
+feedTheCats _ = do
+  cats <- query @Cat
+  debugRaw $ "Feeding " <> show (length cats) <> " cats"
+  forA_ cats \(catCid, Cat{..}) -> do
+--    debug $ "Processing cat with isin " <> (show isin)
+    queryContractKey @Food (owner, isin) >>= \case
+      Some (foodCid, _) -> do
+--        debugRaw $ "Found food for cat with isin " <> (show isin)
+--        dedupExercise catCid (Feed foodCid)
+        emitCommands [exerciseCmd catCid (Feed foodCid)] [toAnyContractId catCid]
+        pure ()
+      None ->
+--        debugRaw $ "Not found food for cat with isin " <> (show isin)
+        pure ()
+
+
+ints : Int -> [Int]
+ints 0 = []
+ints n = n :: ints (n - 1)
+
+
+
+template Helper
+  with
+    owner: Party
+  where
+    signatory owner
+
+    choice Cats: ()
+      with
+        n : Int
+      controller owner
+      do
+        forA_ (ints n) \i ->
+          create (Cat owner i)
+
+    choice Foods: ()
+      with
+        n : Int
+      controller owner
+      do
+        forA_ (ints n) \i ->
+          create (Food owner i)
+
+setup : S.Script ()
+setup = S.script do
+-- user_setup_begin
+  alice <- S.allocatePartyWithHint "Alice" (S.PartyIdHint "Alice")
+  aliceId <- S.validateUserId "alice"
+  S.createUser (S.User aliceId (Some alice)) [S.CanActAs alice]
+  _ <- S.submit alice $ S.createAndExerciseCmd (Helper alice) (Cats 200)
+  _ <- S.submit alice $ S.createAndExerciseCmd (Helper alice) (Foods 200)
+
+  pure ()
+
