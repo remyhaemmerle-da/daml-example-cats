@@ -3,7 +3,9 @@ module Main where
 import qualified Daml.Script as S
 import Daml.Trigger
 import DA.Foldable (forA_)
-
+import qualified DA.Optional as Optional
+import qualified DA.Map as Map
+import DA.Functor (void)
 
 template Cat
   with
@@ -11,8 +13,8 @@ template Cat
     isin : Int
   where
     signatory owner
-    key (owner, isin) : (Party, Int)
-    maintainer key._1
+    key this : Cat
+    maintainer key.owner
 
     choice Feed : ()
       with
@@ -27,8 +29,8 @@ template Food
     isin : Int
   where
     signatory owner
-    key (owner, isin) : (Party, Int)
-    maintainer key._1
+    key this : Food
+    maintainer key.owner
 
     choice Food_FeedCat : ()
       controller owner
@@ -44,28 +46,51 @@ trigger = Trigger
   , heartbeat = None
   }
 
+limit = 100
+
+tooManyCommandsInFlight : TriggerA s Bool
+tooManyCommandsInFlight = do
+  cs <- getCommandsInFlight
+  pure $ Map.size cs >=limit
+
+emitCommands' cmds pending =
+  tooManyCommandsInFlight >>= \case
+    False -> void $ emitCommands cmds pending
+    True ->  pure ()
+
+for_ : [a] -> (a -> TriggerA c b) -> TriggerA c ()
+for_ (h :: t) f =
+  tooManyCommandsInFlight >>= \case
+    False -> do
+      f h
+      for_ t f
+    True ->
+      pure ()
+for_ _ _ = pure ()
 
 feedTheCats: Party -> TriggerA s ()
 feedTheCats _ = do
   cats <- query @Cat
   debugRaw $ "Feeding " <> show (length cats) <> " cats"
-  forA_ cats \(catCid, Cat{..}) -> do
---    debug $ "Processing cat with isin " <> (show isin)
-    queryContractKey @Food (owner, isin) >>= \case
-      Some (foodCid, _) -> do
---        debugRaw $ "Found food for cat with isin " <> (show isin)
---        dedupExercise catCid (Feed foodCid)
-        emitCommands [exerciseCmd catCid (Feed foodCid)] [toAnyContractId catCid]
-        pure ()
-      None ->
---        debugRaw $ "Not found food for cat with isin " <> (show isin)
-        pure ()
+  for_ cats \(catCid, Cat{..}) -> do
+    debug $ "Processing cat with isin " <> (show isin)
+    tooManyCommandsInFlight >>= \case
+       True ->
+         debugRaw $ "Too many command in flight, skip isin " <> (show isin)
+       False -> do
+         queryContractKey @Food (Food owner isin) >>= \case
+           Some (foodCid, _) -> do
+             debugRaw $ "Found food for cat with isin " <> (show isin)
+--             void $ dedupExercise catCid (Feed foodCid)
+             void $ emitCommands' [exerciseCmd catCid (Feed foodCid)] [toAnyContractId catCid, toAnyContractId foodCid]
+           None -> do
+             debugRaw $ "Not found food for cat with isin " <> (show isin)
+             pure ()
 
 
 ints : Int -> [Int]
 ints 0 = []
 ints n = n :: ints (n - 1)
-
 
 
 template Helper
@@ -75,29 +100,75 @@ template Helper
     signatory owner
 
     choice Cats: ()
-      with
-        n : Int
       controller owner
       do
-        forA_ (ints n) \i ->
-          create (Cat owner i)
+        forA_ (ints k) \i -> do
+          l <- lookupByKey @Cat (Cat owner i)
+          case l of
+            None -> void $ create (Cat owner i)
+            Some _ -> pure ()
 
     choice Foods: ()
-      with
-        n : Int
+      controller owner
+       do
+        forA_ (ints k) \i -> do
+          l <- lookupByKey @Food (Food owner i)
+          case l of
+            None -> void $ create (Food owner i)
+            Some _ -> pure ()
+
+    choice Eat: ()
+      with i : Int
       controller owner
       do
-        forA_ (ints n) \i ->
-          create (Food owner i)
+        r <- lookupByKey @Food (Food owner i)
+        case r of
+          None -> pure ()
+          Some _ -> exerciseByKey @Food (Food owner i) Archive
+
+
+    choice EatAll: ()
+      controller owner
+      do
+        forA_ (ints k) \i ->  do
+          r <- lookupByKey @Food (Food owner i)
+          case r of
+            None -> pure ()
+            Some _ -> exerciseByKey @Food (Food owner i) Archive
+
+
+k = 600
 
 setup : S.Script ()
 setup = S.script do
 -- user_setup_begin
   alice <- S.allocatePartyWithHint "Alice" (S.PartyIdHint "Alice")
   aliceId <- S.validateUserId "alice"
-  S.createUser (S.User aliceId (Some alice)) [S.CanActAs alice]
-  _ <- S.submit alice $ S.createAndExerciseCmd (Helper alice) (Cats 200)
-  _ <- S.submit alice $ S.createAndExerciseCmd (Helper alice) (Foods 200)
+  _ <- S.createUser (S.User aliceId (Some alice)) [S.CanActAs alice]
+  init
 
+string2Party party =  do
+   userId <- S.validateUserId party
+   user <- S.getUser userId
+   pure $ Optional.fromSome user.primaryParty
+
+init : S.Script ()
+init = do
+  alice <- string2Party "alice"
+  _ <- S.submit alice $ S.createAndExerciseCmd (Helper alice) Cats
+  _ <- S.submit alice $ S.createAndExerciseCmd (Helper alice) Foods
   pure ()
 
+eatAll : S.Script ()
+eatAll = S.script do
+  alice  <- string2Party "alice"
+  forA_ (ints k) \i ->  do
+    S.submit alice $ S.createAndExerciseCmd (Helper alice) (Eat i)
+
+--  void $ S.submit alice $ S.createAndExerciseCmd (Helper alice) EatAll
+
+
+
+
+-- daml trigger --dar .daml/dist/cat-0.0.1.dar --trigger-name Main:trigger --ledger-host localhost --ledger-port 6865 --ledger-user alice
+-- time daml script --dar .daml/dist/cat-0.0.1.dar  --ledger-host localhost --ledger-port 6865  --script-name Main:init
