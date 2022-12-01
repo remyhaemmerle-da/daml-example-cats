@@ -73,25 +73,24 @@ feedTheCats _ = do
   cats <- query @Cat
   debugRaw $ "Feeding " <> show (length cats) <> " cats"
   for_ cats \(catCid, Cat{..}) -> do
-    debug $ "Processing cat with isin " <> (show isin)
+    -- debug $ "Processing cat with isin " <> (show isin)
     tooManyCommandsInFlight >>= \case
        True ->
          debugRaw $ "Too many command in flight, skip isin " <> (show isin)
        False -> do
          queryContractKey @Food (Food owner isin) >>= \case
            Some (foodCid, _) -> do
-             debugRaw $ "Found food for cat with isin " <> (show isin)
+--             debugRaw $ "Found food for cat with isin " <> (show isin)
 --             void $ dedupExercise catCid (Feed foodCid)
-             void $ emitCommands' [exerciseCmd catCid (Feed foodCid)] [toAnyContractId catCid, toAnyContractId foodCid]
+             void $ emitCommands [exerciseCmd catCid (Feed foodCid)] [toAnyContractId catCid, toAnyContractId foodCid]
            None -> do
-             debugRaw $ "Not found food for cat with isin " <> (show isin)
+--             debugRaw $ "Not found food for cat with isin " <> (show isin)
              pure ()
 
 
 ints : Int -> [Int]
 ints 0 = []
 ints n = n :: ints (n - 1)
-
 
 template Helper
   with
@@ -124,20 +123,23 @@ template Helper
         r <- lookupByKey @Food (Food owner i)
         case r of
           None -> pure ()
-          Some _ -> exerciseByKey @Food (Food owner i) Archive
+          Some _ -> do
+            exerciseByKey @Food (Food owner i) Archive
 
 
     choice EatAll: ()
       controller owner
       do
         forA_ (ints k) \i ->  do
+
           r <- lookupByKey @Food (Food owner i)
           case r of
             None -> pure ()
-            Some _ -> exerciseByKey @Food (Food owner i) Archive
+            Some _ ->
+              do
+                exerciseByKey @Food (Food owner i) Archive
 
-
-k = 600
+k = 200
 
 setup : S.Script ()
 setup = S.script do
@@ -165,10 +167,25 @@ eatAll = S.script do
   forA_ (ints k) \i ->  do
     S.submit alice $ S.createAndExerciseCmd (Helper alice) (Eat i)
 
---  void $ S.submit alice $ S.createAndExerciseCmd (Helper alice) EatAll
 
-
-
-
--- daml trigger --dar .daml/dist/cat-0.0.1.dar --trigger-name Main:trigger --ledger-host localhost --ledger-port 6865 --ledger-user alice
--- time daml script --dar .daml/dist/cat-0.0.1.dar  --ledger-host localhost --ledger-port 6865  --script-name Main:init
+-- # Affected Daml version
+--
+-- can be reproduce with 2.4.0 and 2.5.0
+--
+-- # Bug description
+--
+-- When running in parallel with another client updating concurrently the ledger,  the triggers stop processing the transaction stream and stay with an  outdated ACS
+--
+-- # To reproduce
+--
+-- 1. In a first terminal run
+--   daml start
+-- 2. Wait the sandbox has properly start, then run the trigger in another terminal
+--   daml trigger --dar .daml/dist/cat-0.0.1.dar --trigger-name Main:trigger --ledger-host localhost --ledger-port 6865 --ledger-user alice
+-- 3. Run immediatly, in a third termninal the script
+--   daml script --dar .daml/dist/cat-0.0.1.dar  --ledger-host localhost --ledger-port 6865  --script-name Main:eatAll
+-- 4. Observe the trigger starts to fail, but never recover
+--
+-- # Additional context
+--
+-- bug initially reported by @arturpoor-da
