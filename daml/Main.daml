@@ -116,8 +116,8 @@ trigger = Trigger
   , heartbeat = None
   }
 
-limit = 10
-n = limit * 10
+limit = 100
+n = limit * 5
 
 ints : Int -> [Int]
 ints 0 = []
@@ -139,6 +139,13 @@ skipIfLock otherwise action = do
   else
     action
 
+for_ : [a] -> (a -> TriggerA c b) -> TriggerA c ()
+for_ (h :: t) f =
+  skipIfTooManyCommandsInFlight () $ do
+      f h
+      for_ t f
+for_ _ _ = pure ()
+
 countTransaction: Message -> TriggerUpdateA Int ()
 countTransaction (MTransaction _) = do
   i <- get
@@ -153,13 +160,12 @@ feedTheCats _ = do
   cs <- getCommandsInFlight
   debugRaw $ "Feeding " <> show (length cats) <> " cats (" <> show (Map.size cs) <>  ")"
   skipIfLock () $
-    skipIfTooManyCommandsInFlight () $ do
-      forA_ cats \(catCid, Cat{..}) -> do
-        queryContractKey @Food (Food owner isin) >>= \case
-          Some (foodCid, _) ->
-            void $ emitCommands [exerciseCmd catCid (Feed foodCid)] [toAnyContractId catCid, toAnyContractId foodCid]
-          None ->
-            pure ()
+    for_ cats \(catCid, Cat{..}) -> do
+      queryContractKey @Food (Food owner isin) >>= \case
+        Some (foodCid, _) ->
+          void $ emitCommands [exerciseCmd catCid (Feed foodCid)] [toAnyContractId catCid, toAnyContractId foodCid]
+        None ->
+          pure ()
 
 
 setup : S.Script ()
@@ -178,7 +184,7 @@ string2Party party =  do
 init : S.Script ()
 init = do
   alice <- string2Party "alice"
---  _ <- S.submit alice $ S.createCmd $ Lock alice
+  _ <- S.submit alice $ S.createCmd $ Lock alice
   _ <- S.submit alice $ S.createAndExerciseCmd (Helper alice) Cats
   _ <- S.submit alice $ S.createAndExerciseCmd (Helper alice) Foods
   pure ()
@@ -186,6 +192,6 @@ init = do
 eatAll : S.Script ()
 eatAll = S.script do
   alice  <- string2Party "alice"
---  _ <-  S.submit alice $ S.exerciseByKeyCmd @Lock alice Archive
+  _ <-  S.submit alice $ S.exerciseByKeyCmd @Lock alice Archive
   forA_ (ints n) \i ->  do
     S.submit alice $ S.createAndExerciseCmd (Helper alice) (Eat i)
