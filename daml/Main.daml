@@ -37,60 +37,39 @@ template Food
       do
         pure ()
 
+template Counter
+  with
+    owner: Party
+    id: Text
+    i: Int
+  where
+    signatory owner
+    key (owner, id) : (Party, Text)
+    maintainer key._1
+    choice Incr : Int
+       controller owner
+        do
+          let j = i + 1
+          create $ this with i = j
+          pure j
+
+template Lock
+  with
+    owner: Party
+  where
+    signatory owner
+    key owner : Party
+    maintainer key
+
 trigger : Trigger ()
 trigger = Trigger
   { initialize = pure ()
-  , updateState = \_ -> pure ()
+  , updateState = const $ pure ()
   , rule = feedTheCats
-  , registeredTemplates =  RegisteredTemplates [ registeredTemplate @Cat, registeredTemplate @Food ]
+  , registeredTemplates =  RegisteredTemplates [ registeredTemplate @Cat, registeredTemplate @Food, registeredTemplate @Lock ]
   , heartbeat = None
   }
 
-limit = 100
-
-tooManyCommandsInFlight : TriggerA s Bool
-tooManyCommandsInFlight = do
-  cs <- getCommandsInFlight
-  pure $ Map.size cs >=limit
-
-emitCommands' cmds pending =
-  tooManyCommandsInFlight >>= \case
-    False -> void $ emitCommands cmds pending
-    True ->  pure ()
-
-for_ : [a] -> (a -> TriggerA c b) -> TriggerA c ()
-for_ (h :: t) f =
-  tooManyCommandsInFlight >>= \case
-    False -> do
-      f h
-      for_ t f
-    True ->
-      pure ()
-for_ _ _ = pure ()
-
-feedTheCats: Party -> TriggerA s ()
-feedTheCats _ = do
-  cats <- query @Cat
-  debugRaw $ "Feeding " <> show (length cats) <> " cats"
-  for_ cats \(catCid, Cat{..}) -> do
-    -- debug $ "Processing cat with isin " <> (show isin)
-    tooManyCommandsInFlight >>= \case
-       True ->
-         debugRaw $ "Too many command in flight, skip isin " <> (show isin)
-       False -> do
-         queryContractKey @Food (Food owner isin) >>= \case
-           Some (foodCid, _) -> do
---             debugRaw $ "Found food for cat with isin " <> (show isin)
---             void $ dedupExercise catCid (Feed foodCid)
-             void $ emitCommands [exerciseCmd catCid (Feed foodCid)] [toAnyContractId catCid, toAnyContractId foodCid]
-           None -> do
---             debugRaw $ "Not found food for cat with isin " <> (show isin)
-             pure ()
-
-
-ints : Int -> [Int]
-ints 0 = []
-ints n = n :: ints (n - 1)
 
 template Helper
   with
@@ -101,7 +80,7 @@ template Helper
     choice Cats: ()
       controller owner
       do
-        forA_ (ints k) \i -> do
+        forA_ (ints n) \i -> do
           l <- lookupByKey @Cat (Cat owner i)
           case l of
             None -> void $ create (Cat owner i)
@@ -110,7 +89,7 @@ template Helper
     choice Foods: ()
       controller owner
        do
-        forA_ (ints k) \i -> do
+        forA_ (ints n) \i -> do
           l <- lookupByKey @Food (Food owner i)
           case l of
             None -> void $ create (Food owner i)
@@ -126,11 +105,10 @@ template Helper
           Some _ -> do
             exerciseByKey @Food (Food owner i) Archive
 
-
     choice EatAll: ()
       controller owner
       do
-        forA_ (ints k) \i ->  do
+        forA_ (ints n) \i ->  do
 
           r <- lookupByKey @Food (Food owner i)
           case r of
@@ -139,7 +117,44 @@ template Helper
               do
                 exerciseByKey @Food (Food owner i) Archive
 
-k = 200
+limit = 10
+n = limit * 5
+
+ints : Int -> [Int]
+ints 0 = []
+ints n = n :: ints (n - 1)
+
+skipIfTooManyCommandsInFlight: a -> (TriggerA s a) -> (TriggerA s a)
+skipIfTooManyCommandsInFlight otherwise action  = do
+  cs <- getCommandsInFlight
+  if Map.size cs >= limit then
+    pure otherwise
+  else
+    action
+
+skipIfLock: a -> (TriggerA s a) -> (TriggerA s a)
+skipIfLock otherwise action = do
+  locks <- query @Lock
+  if (length locks > 0) then
+    pure otherwise
+  else
+    action
+
+feedTheCats: Party -> TriggerA s ()
+feedTheCats _ = do
+  cats <- query @Cat
+  locks <- query @Lock
+  cs <- getCommandsInFlight
+  debugRaw $ "Feeding " <> show (length cats) <> " cats (" <> show (Map.size cs) <>  ")"
+  skipIfLock () $
+    skipIfTooManyCommandsInFlight () $
+      void $ forA cats \(catCid, Cat{..}) -> do
+        queryContractKey @Food (Food owner isin) >>= \case
+          Some (foodCid, _) ->
+            void $ emitCommands [exerciseCmd catCid (Feed foodCid)] [toAnyContractId catCid, toAnyContractId foodCid]
+          None ->
+            pure ()
+
 
 setup : S.Script ()
 setup = S.script do
@@ -157,6 +172,7 @@ string2Party party =  do
 init : S.Script ()
 init = do
   alice <- string2Party "alice"
+  _ <- S.submit alice $ S.createCmd $ Lock alice
   _ <- S.submit alice $ S.createAndExerciseCmd (Helper alice) Cats
   _ <- S.submit alice $ S.createAndExerciseCmd (Helper alice) Foods
   pure ()
@@ -164,28 +180,6 @@ init = do
 eatAll : S.Script ()
 eatAll = S.script do
   alice  <- string2Party "alice"
-  forA_ (ints k) \i ->  do
+  _ <-  S.submit alice $ S.exerciseByKeyCmd @Lock alice Archive
+  forA_ (ints n) \i ->  do
     S.submit alice $ S.createAndExerciseCmd (Helper alice) (Eat i)
-
-
--- # Affected Daml version
---
--- can be reproduce with 2.4.0 and 2.5.0
---
--- # Bug description
---
--- When running in parallel with another client updating concurrently the ledger,  the triggers stop processing the transaction stream and stay with an  outdated ACS
---
--- # To reproduce
---
--- 1. In a first terminal run
---   daml start
--- 2. Wait the sandbox has properly start, then run the trigger in another terminal
---   daml trigger --dar .daml/dist/cat-0.0.1.dar --trigger-name Main:trigger --ledger-host localhost --ledger-port 6865 --ledger-user alice
--- 3. Run immediatly, in a third termninal the script
---   daml script --dar .daml/dist/cat-0.0.1.dar  --ledger-host localhost --ledger-port 6865  --script-name Main:eatAll
--- 4. Observe the trigger starts to fail, but never recover
---
--- # Additional context
---
--- bug initially reported by @arturpoor-da
