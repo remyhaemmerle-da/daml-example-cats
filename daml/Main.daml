@@ -6,6 +6,7 @@ import DA.Foldable (forA_)
 import qualified DA.Optional as Optional
 import qualified DA.Map as Map
 import DA.Functor (void)
+import DA.Time
 
 template Cat
   with
@@ -14,6 +15,7 @@ template Cat
   where
     signatory owner
     key this : Cat
+    agreement "is not empty"
     maintainer key.owner
 
     choice Feed : ()
@@ -116,8 +118,48 @@ trigger = Trigger
   , heartbeat = None
   }
 
+data State =
+    Failure
+  | WaitUntil Time
+  | OK
+
+delay = seconds 2
+
+adaptRule:  (Party -> TriggerA State ()) -> Party -> TriggerA State ()
+adaptRule rule party =
+  get >>= \case
+    Failure -> do
+      t <- getTime
+      put $ WaitUntil $ t `addRelTime` delay
+    WaitUntil t1 -> do
+      t2 <- getTime
+      if (t2 < t1) then
+        debugRaw $ "cats: skip"
+      else do
+        rule party
+        put OK
+    OK ->
+      rule party
+
+update: Message -> TriggerUpdateA State ()
+update (MCompletion (Completion _ Failed {})) = put Failure
+update MHeartbeat = debugRaw $ "cats: heartbeat received"
+update (MTransaction _) = debugRaw $ "cats: transaction received"
+update (MCompletion _) = debugRaw $  "cats: completion received"
+
+
+trigger2 : Trigger State
+trigger2 = Trigger
+  { initialize = pure OK
+  , updateState = update
+  , rule = adaptRule feedTheCats
+  , registeredTemplates =  RegisteredTemplates [ registeredTemplate @Cat, registeredTemplate @Food, registeredTemplate @Lock ]
+  , heartbeat = Some (seconds 20)
+  }
+
+
 limit = 100
-n = limit * 5
+n = 500
 
 ints : Int -> [Int]
 ints 0 = []
@@ -156,9 +198,10 @@ countTransaction _ = pure ()
 feedTheCats: Party -> TriggerA s ()
 feedTheCats _ = do
   cats <- query @Cat
+  foods <- query @Food
   locks <- query @Lock
   cs <- getCommandsInFlight
-  debugRaw $ "Feeding " <> show (length cats) <> " cats (" <> show (Map.size cs) <>  ")"
+  debugRaw $ "Feeding " <> show (length cats) <> " cats with " <> show (length foods) <> " foods (" <> show (Map.size cs) <>  ")"
   skipIfLock () $
     for_ cats \(catCid, Cat{..}) -> do
       queryContractKey @Food (Food owner isin) >>= \case
