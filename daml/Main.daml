@@ -147,9 +147,9 @@ trigger2 = trigger with { rule = feedTheCats2 }
 -- backoff if receive failure
 
 data BackoffState =
-    Failure          -- we just receive a failure
-  | WaitUntil Time   --
-  | OK               --
+    Failure          -- marks we have receieved a failure bewteen two rule applications
+  | WaitUntil Time   -- marks the backoff time limit
+  | OK               -- marks rule should be triggered normally
 
 delay = seconds 2
 
