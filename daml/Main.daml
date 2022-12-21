@@ -39,22 +39,6 @@ template Food
       do
         pure ()
 
-template Counter
-  with
-    owner: Party
-    id: Text
-    i: Int
-  where
-    signatory owner
-    key (owner, id) : (Party, Text)
-    maintainer key._1
-    choice CounterUpdate : ()
-      with j : Int
-        controller owner
-        do
-          create $ this with i = j
-          pure ()
-
 template Lock
   with
     owner: Party
@@ -62,116 +46,6 @@ template Lock
     signatory owner
     key owner : Party
     maintainer key
-
-template Helper
-  with
-    owner: Party
-  where
-    signatory owner
-
-    choice Cats: ()
-      controller owner
-      do
-        forA_ (ints n) \i -> do
-          l <- lookupByKey @Cat (Cat owner i)
-          case l of
-            None -> void $ create (Cat owner i)
-            Some _ -> pure ()
-
-    choice Foods: ()
-      controller owner
-       do
-        forA_ (ints n) \i -> do
-          l <- lookupByKey @Food (Food owner i)
-          case l of
-            None -> void $ create (Food owner i)
-            Some _ -> pure ()
-
-    choice Eat: ()
-      with i : Int
-      controller owner
-      do
-        r <- lookupByKey @Food (Food owner i)
-        case r of
-          None -> pure ()
-          Some _ -> do
-            exerciseByKey @Food (Food owner i) Archive
-
-    choice EatAll: ()
-      controller owner
-      do
-        forA_ (ints n) \i ->  do
-
-          r <- lookupByKey @Food (Food owner i)
-          case r of
-            None -> pure ()
-            Some _ ->
-              do
-                exerciseByKey @Food (Food owner i) Archive
-
-trigger : Trigger Int
-trigger = Trigger
-  { initialize = pure 0
-  , updateState = countTransaction
-  , rule = feedTheCats
-  , registeredTemplates =  RegisteredTemplates [ registeredTemplate @Cat, registeredTemplate @Food, registeredTemplate @Lock ]
-  , heartbeat = None
-  }
-
-data State =
-    Failure
-  | WaitUntil Time
-  | OK
-
-delay = seconds 2
-
-adaptRule:  (Party -> TriggerA State ()) -> Party -> TriggerA State ()
-adaptRule rule party =
-  get >>= \case
-    Failure -> do
-      t <- getTime
-      put $ WaitUntil $ t `addRelTime` delay
-    WaitUntil t1 -> do
-      t2 <- getTime
-      if (t2 < t1) then
-        debugRaw $ "cats: skip"
-      else do
-        rule party
-        put OK
-    OK ->
-      rule party
-
-update: Message -> TriggerUpdateA State ()
-update (MCompletion (Completion _ Failed {})) = put Failure
-update MHeartbeat = debugRaw $ "cats: heartbeat received"
-update (MTransaction _) = debugRaw $ "cats: transaction received"
-update (MCompletion _) = debugRaw $  "cats: completion received"
-
-
-trigger2 : Trigger State
-trigger2 = Trigger
-  { initialize = pure OK
-  , updateState = update
-  , rule = adaptRule feedTheCats
-  , registeredTemplates =  RegisteredTemplates [ registeredTemplate @Cat, registeredTemplate @Food, registeredTemplate @Lock ]
-  , heartbeat = Some (seconds 20)
-  }
-
-
-limit = 100
-n = 500
-
-ints : Int -> [Int]
-ints 0 = []
-ints n = n :: ints (n - 1)
-
-skipIfTooManyCommandsInFlight: a -> (TriggerA s a) -> (TriggerA s a)
-skipIfTooManyCommandsInFlight otherwise action  = do
-  cs <- getCommandsInFlight
-  if Map.size cs >= limit then
-    pure otherwise
-  else
-    action
 
 skipIfLock: a -> (TriggerA s a) -> (TriggerA s a)
 skipIfLock otherwise action = do
@@ -181,19 +55,7 @@ skipIfLock otherwise action = do
   else
     action
 
-for_ : [a] -> (a -> TriggerA c b) -> TriggerA c ()
-for_ (h :: t) f =
-  skipIfTooManyCommandsInFlight () $ do
-      f h
-      for_ t f
-for_ _ _ = pure ()
-
-countTransaction: Message -> TriggerUpdateA Int ()
-countTransaction (MTransaction _) = do
-  i <- get
-  debugRaw $ "Saw a total of " <> show (i+1) <> " transactions until now"
-  put (i+1)
-countTransaction _ = pure ()
+-- Naive implementation
 
 feedTheCats: Party -> TriggerA s ()
 feedTheCats _ = do
@@ -203,20 +65,196 @@ feedTheCats _ = do
   cs <- getCommandsInFlight
   debugRaw $ "Feeding " <> show (length cats) <> " cats with " <> show (length foods) <> " foods (" <> show (Map.size cs) <>  ")"
   skipIfLock () $
-    for_ cats \(catCid, Cat{..}) -> do
+    forA_ cats \(catCid, Cat{..}) -> do
       queryContractKey @Food (Food owner isin) >>= \case
         Some (foodCid, _) ->
           void $ emitCommands [exerciseCmd catCid (Feed foodCid)] [toAnyContractId catCid, toAnyContractId foodCid]
         None ->
           pure ()
 
+trigger : Trigger ()
+trigger = Trigger
+  { initialize = pure ()
+  , updateState = const $ debugRaw $ "message recieved"
+  , rule = feedTheCats
+  , registeredTemplates =  RegisteredTemplates [ registeredTemplate @Cat, registeredTemplate @Food, registeredTemplate @Lock ]
+  , heartbeat = None
+  }
+
+-- IMPROVMENT I
+-- limit the number of inflight commands
+
+maximalNumberOfInflightCommands = 100
+
+skipIfTooManyCommandsInFlight: a -> (TriggerA s a) -> (TriggerA s a)
+skipIfTooManyCommandsInFlight otherwise action  = do
+  cs <- getCommandsInFlight
+  if Map.size cs >= maximalNumberOfInflightCommands then
+    pure otherwise
+  else
+    action
+
+emitCommands' c p = skipIfTooManyCommandsInFlight () $ void $ emitCommands c p
+
+feedTheCats1: Party -> TriggerA s ()
+feedTheCats1 _ = do
+  cats <- query @Cat
+  foods <- query @Food
+  locks <- query @Lock
+  cs <- getCommandsInFlight
+  debugRaw $ "Feeding " <> show (length cats) <> " cats with " <> show (length foods) <> " foods (" <> show (Map.size cs) <>  ")"
+  skipIfLock () $
+    forA_ cats \(catCid, Cat{..}) -> do
+      queryContractKey @Food (Food owner isin) >>= \case
+        Some (foodCid, _) ->
+          void $ emitCommands' [exerciseCmd catCid (Feed foodCid)] [toAnyContractId catCid, toAnyContractId foodCid]
+        None ->
+          pure ()
+
+trigger1 : Trigger ()
+trigger1 = trigger with { rule = feedTheCats1 }
+
+-- IMPROVMENT II
+-- shortcut the rule if too many inflight commands
+
+for_ : [a] -> (a -> TriggerA c b) -> TriggerA c ()
+for_ (h :: t) f =
+  skipIfTooManyCommandsInFlight () $ do
+      f h
+      for_ t f
+for_ _ _ = pure ()
+
+feedTheCats2: Party -> TriggerA s ()
+feedTheCats2 _ = do
+  cats <- query @Cat
+  foods <- query @Food
+  locks <- query @Lock
+  cs <- getCommandsInFlight
+  debugRaw $ "Feeding " <> show (length cats) <> " cats with " <> show (length foods) <> " foods (" <> show (Map.size cs) <>  ")"
+  skipIfLock () $
+    for_ cats \(catCid, Cat{..}) -> do
+      queryContractKey @Food (Food owner isin) >>= \case
+        Some (foodCid, _) ->
+          void $ emitCommands' [exerciseCmd catCid (Feed foodCid)] [toAnyContractId catCid, toAnyContractId foodCid]
+        None ->
+          pure ()
+
+
+trigger2 : Trigger ()
+trigger2 = trigger with { rule = feedTheCats2 }
+
+-- IMPROVMENT III
+-- backoff if receive failure
+
+data BackoffState =
+    Failure          -- we just receive a failure
+  | WaitUntil Time   --
+  | OK               --
+
+delay = seconds 2
+
+adaptRule:  (Party -> TriggerA BackoffState ()) -> Party -> TriggerA BackoffState ()
+adaptRule rule party =
+  get >>= \case
+    Failure -> do
+      t <- getTime
+      let until = t `addRelTime` delay in do
+      debugRaw $ "We just recieved a failure: we will wait until " <> (show until) <> " before triggering the rule again"
+      put $ WaitUntil $ until
+    WaitUntil until -> do
+      t <- getTime
+      if (t <= until) then
+        debugRaw $ "We did not reach the backoff time limit: we skip the rule application"
+      else do
+        rule party
+        put OK
+    OK ->
+      rule party
+
+updateBackoffState: Message -> TriggerUpdateA BackoffState ()
+updateBackoffState (MCompletion (Completion _ Failed {})) = do
+  debugRaw $  "we recieved failure completion"
+  put Failure
+updateBackoffState (MCompletion _) = debugRaw $ "we recieved sucess completion"
+updateBackoffState MHeartbeat = debugRaw $ "we recieve a heartbeat"
+updateBackoffState (MTransaction _) = debugRaw $ "we recieve a transaction"
+
+trigger3 : Trigger BackoffState
+trigger3 = Trigger {
+    initialize = pure OK
+  , updateState = updateBackoffState
+  , rule = adaptRule feedTheCats2
+  , registeredTemplates = trigger.registeredTemplates
+  , heartbeat = Some (seconds 20)
+  }
+
+-- SETUP AND HELPER
+
+n = 500 -- number of cats
+
+ints : Int -> [Int]
+ints 0 = []
+ints n = n :: ints (n - 1)
+
+template Helper
+  with
+    owner: Party
+  where
+    signatory owner
+
+    choice LockIfNeeded: ()
+      controller owner
+      do
+        lookupByKey @Lock owner >>= \case
+          None -> void $ create (Lock owner)
+          Some cid -> pure ()
+
+
+    choice Cats: ()
+      controller owner
+      do
+        forA_ (ints n) \i -> do
+          lookupByKey @Cat (Cat owner i) >>= \case
+            None -> void $ create (Cat owner i)
+            Some _ -> pure ()
+
+    choice Foods: ()
+      controller owner
+       do
+        forA_ (ints n) \i -> do
+          lookupByKey @Food (Food owner i) >>= \case
+            None -> void $ create (Food owner i)
+            Some _ -> pure ()
+
+    choice Eat: ()
+      with i : Int
+      controller owner
+      do
+        lookupByKey @Food (Food owner i) >>= \case
+          None -> pure ()
+          Some cid -> archive cid
+
+    choice EatAll: ()
+      controller owner
+      do
+        forA_ (ints n) \i ->
+          lookupByKey @Food (Food owner i) >>= \case
+            None -> pure ()
+            Some cid -> archive cid
+
+    choice Unlock: ()
+      controller owner
+      do
+        lookupByKey @Lock owner >>= \case
+          None -> pure ()
+          Some cid -> archive cid
 
 setup : S.Script ()
 setup = S.script do
 -- user_setup_begin
   alice <- S.allocatePartyWithHint "Alice" (S.PartyIdHint "Alice")
   aliceId <- S.validateUserId "alice"
-  _ <- S.createUser (S.User aliceId (Some alice)) [S.CanActAs alice]
+  S.createUser (S.User aliceId (Some alice)) [S.CanActAs alice]
   init
 
 string2Party party =  do
@@ -227,14 +265,14 @@ string2Party party =  do
 init : S.Script ()
 init = do
   alice <- string2Party "alice"
-  _ <- S.submit alice $ S.createCmd $ Lock alice
-  _ <- S.submit alice $ S.createAndExerciseCmd (Helper alice) Cats
-  _ <- S.submit alice $ S.createAndExerciseCmd (Helper alice) Foods
+  S.submit alice $ S.createAndExerciseCmd (Helper alice) LockIfNeeded
+  S.submit alice $ S.createAndExerciseCmd (Helper alice) Cats
+  S.submit alice $ S.createAndExerciseCmd (Helper alice) Foods
   pure ()
 
 eatAll : S.Script ()
 eatAll = S.script do
   alice  <- string2Party "alice"
-  _ <-  S.submit alice $ S.exerciseByKeyCmd @Lock alice Archive
+  S.submit alice $ S.createAndExerciseCmd (Helper alice) Unlock
   forA_ (ints n) \i ->  do
     S.submit alice $ S.createAndExerciseCmd (Helper alice) (Eat i)
