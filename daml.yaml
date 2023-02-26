@@ -1,10 +1,11 @@
 # for config file options, refer to
 # https://docs.daml.com/tools/assistant.html#project-config-file-daml-yaml
 
-sdk-version: 2.4.0
+sdk-version: 2.5.1
+#sdk-version: 2.6.0-snapshot.20230210.11415.0.5c00481a
 name: cat
 source: daml
-init-script: Main:setup
+init-script: Main:setup_user
 version: 0.0.1
 dependencies:
   - daml-prim

@@ -55,6 +55,84 @@ skipIfLock otherwise action = do
   else
     action
 
+mod = 2^31
+
+random : Int -> (Int, Numeric 10)
+random seed =
+  (newSeed, (intToNumeric seed) / (intToNumeric mod))
+  where newSeed = (1103515245 * seed + 12345) % mod
+
+data MyState = MyState {
+  run: Bool,
+  seed: Int,
+  cats: [Int],
+  food: [Int],
+  last: Int
+}
+
+x : Text -> Optional Party
+x = partyFromText
+
+createCats : Party -> Int -> [Int] -> [Int] -> TriggerA s (Int, [Int])
+createCats _ seed acc [] = pure (seed, acc)
+createCats party seed acc (n :: tail) =
+  if (r < 0.5) then do
+    debugRaw $ "createCat_" <> (show n)
+    emitCommands [createCmd (Cat party n)] []
+    createCats party newSeed acc tail
+  else
+      createCats party newSeed (n :: acc) tail
+  where
+    (newSeed, r) = random seed
+
+nInts : Int -> Int -> [Int] -> [Int]
+nInts x y acc
+  | x == y    = acc
+  | otherwise = nInts (x+1) y (x :: acc)
+
+
+createFoods : Party -> Int -> [Int] -> [Int] -> TriggerA s (Int, [Int])
+createFoods _ seed acc [] = pure (seed, acc)
+createFoods party seed acc (n :: tail) =
+  if (r < 0.5) then do
+    debugRaw $ "createFood_" <> (show n)
+    emitCommands [createCmd (Food party n)] []
+    createFoods party newSeed acc tail
+  else
+      createFoods party newSeed (n :: acc) tail
+  where
+    (newSeed, r) = random seed
+
+populateR: Party -> TriggerA MyState ()
+populateR party = do
+    MyState run seed cats foods n <- get
+    case run of
+      True -> do
+        (seed, r) <- pure $ random seed
+        m <- pure $ n + (truncate $ r * 10.0)
+        debugRaw $ "Remy: Rule: " <> show (n, m)
+        (seed, cats) <- createCats party seed [] (nInts n m cats)
+        (seed, foods) <- createFoods party seed [] (nInts n m foods)
+        put $ MyState False seed cats foods m
+      False ->
+        pure ()
+
+populate:  Trigger MyState
+populate = Trigger
+  { initialize = pure $ MyState False 10 [] [] 0
+  , updateState = \case
+      MTransaction _ -> debugRaw "Remy: Message T"
+      MCompletion _ -> debugRaw "Remy: Message C"
+      MHeartbeat -> do
+        state <- get
+        put (state with run = True)
+--        debugRaw "Remy: Message H"
+  , rule = populateR
+  , registeredTemplates =  RegisteredTemplates []
+  , heartbeat = Some (seconds 20)
+  }
+
+
 -- Naive implementation
 
 feedTheCats: Party -> TriggerA s ()
@@ -65,17 +143,20 @@ feedTheCats _ = do
   cs <- getCommandsInFlight
   debugRaw $ "Feeding " <> show (length cats) <> " cats with " <> show (length foods) <> " foods (" <> show (Map.size cs) <>  ")"
   skipIfLock () $
-    forA_ cats \(catCid, Cat{..}) -> do
-      queryContractKey @Food (Food owner isin) >>= \case
-        Some (foodCid, _) ->
-          void $ emitCommands [exerciseCmd catCid (Feed foodCid)] [toAnyContractId catCid, toAnyContractId foodCid]
-        None ->
-          pure ()
+    for_ cats \(catCid, Cat{..}) -> do
+        queryContractKey @Food (Food owner isin) >>= \case
+          Some (foodCid, _) ->
+            void $ emitCommands' [exerciseCmd catCid (Feed foodCid)] [toAnyContractId catCid, toAnyContractId foodCid]
+          None ->
+            pure ()
 
 trigger : Trigger ()
 trigger = Trigger
   { initialize = pure ()
-  , updateState = const $ debugRaw $ "message recieved"
+  , updateState = \case
+      MTransaction _ -> debugRaw "Remy: Message T"
+      MCompletion _ -> debugRaw "Remy: Message C"
+      MHeartbeat ->  debugRaw "Remy: Message H"
   , rule = feedTheCats
   , registeredTemplates =  RegisteredTemplates [ registeredTemplate @Cat, registeredTemplate @Food, registeredTemplate @Lock ]
   , heartbeat = None
@@ -100,11 +181,11 @@ feedTheCats1: Party -> TriggerA s ()
 feedTheCats1 _ = do
   cats <- query @Cat
   foods <- query @Food
-  locks <- query @Lock
+--  locks <- query @Lock
   cs <- getCommandsInFlight
-  debugRaw $ "Feeding " <> show (length cats) <> " cats with " <> show (length foods) <> " foods (" <> show (Map.size cs) <>  ")"
+  debugRaw $ "Remy Feeding " <> show (length cats) <> " cats with " <> show (length foods) <> " foods (" <> show (Map.size cs) <>  ")"
   skipIfLock () $
-    forA_ cats \(catCid, Cat{..}) -> do
+    for_ cats \(catCid, Cat{..}) -> do
       queryContractKey @Food (Food owner isin) >>= \case
         Some (foodCid, _) ->
           void $ emitCommands' [exerciseCmd catCid (Feed foodCid)] [toAnyContractId catCid, toAnyContractId foodCid]
@@ -249,12 +330,15 @@ template Helper
           None -> pure ()
           Some cid -> archive cid
 
-setup : S.Script ()
-setup = S.script do
--- user_setup_begin
+setup_user: S.Script ()
+setup_user = do
   alice <- S.allocatePartyWithHint "Alice" (S.PartyIdHint "Alice")
   aliceId <- S.validateUserId "alice"
   S.createUser (S.User aliceId (Some alice)) [S.CanActAs alice]
+
+setup : S.Script ()
+setup = S.script do
+  setup_user
   init
 
 string2Party party =  do
